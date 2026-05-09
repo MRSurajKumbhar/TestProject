@@ -1,21 +1,19 @@
 #!/bin/bash
 
-# --- PRE-FLIGHT CHECK ---
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "        🔍 Pre-Push Impact Analysis"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# Check Xcode is installed
+# --- PRE-FLIGHT CHECK ---
 if ! xcrun --find xcodebuild &>/dev/null; then
     echo "❌ Xcode not found."
-    echo "   Please install Xcode from the App Store and try again."
+    echo "   Please install Xcode from the App Store."
     echo ""
     exit 1
 fi
 
-# Check xcodebuild actually responds
 if ! xcrun xcodebuild -version &>/dev/null; then
     echo "❌ Xcode found but not responding."
     echo "   Run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
@@ -24,7 +22,6 @@ if ! xcrun xcodebuild -version &>/dev/null; then
 fi
 
 # --- CONFIGURATION ---
-# Auto-detect project name from .xcodeproj file in repo
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 PROJECT_NAME=$(find "$REPO_ROOT" -maxdepth 3 -name "*.xcodeproj" \
     | head -1 \
@@ -80,19 +77,10 @@ while IFS= read -r FILE; do
 done <<< "$CHANGED_FILES"
 echo ""
 
-# --- STEP 3: Dump index ONCE ---
+# --- STEP 3: Dump raw index ONCE ---
 echo "⏳ Loading compiler index..."
-
-# Try index-store-db first (Xcode 26+)
-if xcrun --find index-store-db &>/dev/null; then
-    INDEX_DUMP=$(xcrun index-store-db list-dependencies \
-        --store-path "$DATA_STORE" 2>/dev/null)
-else
-    # Fallback: extract swift file references from raw index store
-    INDEX_DUMP=$(find "$DATA_STORE" -type f \
-        | xargs strings 2>/dev/null \
-        | grep "\.swift")
-fi
+INDEX_DUMP=$(find "$DATA_STORE" -type f \
+    | xargs strings 2>/dev/null)
 
 if [ -z "$INDEX_DUMP" ]; then
     echo ""
@@ -114,38 +102,50 @@ while IFS= read -r FILE; do
     [ -z "$FILE" ] && continue
     echo "   📄 $FILE"
 
-    # Extract USRs for symbols defined in this file
-    # Swift USR charset: s: prefix + alphanumeric, $, ., :, @
-    USRS=$(grep -F "$FILE" <<< "$INDEX_DUMP" \
-        | grep "def:" \
-        | grep -oE "s:[a-zA-Z0-9_\$.:@]+" \
+    # Extract class/struct/enum/protocol names directly from the source file
+    # This is reliable because we read the actual Swift source
+    SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$REPO_ROOT/$FILE" 2>/dev/null \
+        | awk '{print $2}' \
+        | sed 's/[:(<{].*//' \
         | sort -u)
 
-    if [ -z "$USRS" ]; then
-        echo "      ⚪ No symbols found in index for this file"
+    if [ -z "$SYMBOL_NAMES" ]; then
+        # Also try without REPO_ROOT prefix
+        SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$FILE" 2>/dev/null \
+            | awk '{print $2}' \
+            | sed 's/[:(<{].*//' \
+            | sort -u)
+    fi
+
+    if [ -z "$SYMBOL_NAMES" ]; then
+        echo "      ⚪ No public symbols found in this file"
         continue
     fi
 
-    while IFS= read -r USR; do
-        [ -z "$USR" ] && continue
+    echo "      Symbols found:"
+    while IFS= read -r SYMBOL; do
+        echo "      → $SYMBOL"
+    done <<< "$SYMBOL_NAMES"
 
-        # Find all .swift files referencing this USR
-        REFS=$(grep -F "$USR" <<< "$INDEX_DUMP" \
-            | grep "ref:" \
-            | grep -oE "[^[:space:]]+\.swift")
+    while IFS= read -r SYMBOL; do
+        [ -z "$SYMBOL" ] && continue
 
-        while IFS= read -r REF; do
-            [ -z "$REF" ] && continue
-            if [[ "$REF" == *"Tests.swift" ]] || \
-               [[ "$REF" == *"Spec.swift" ]] || \
-               [[ "$REF" == *"/Tests/"* ]]; then
-                TEST_NAME=$(basename "$REF" .swift)
-                IMPACTED_TESTS+=("$TEST_NAME")
-                echo "      ✅ Found reference → $TEST_NAME"
-            fi
-        done <<< "$REFS"
+        # Search index for test files referencing this symbol
+        # The index stores entries like: ContentViewModelTests...ContentViewModel
+        # We look for lines containing both the symbol AND "Tests"
+        MATCHING_TESTS=$(echo "$INDEX_DUMP" \
+            | grep -F "$SYMBOL" \
+            | grep "Tests" \
+            | grep -oE "[A-Z][a-zA-Z]+Tests" \
+            | sort -u)
 
-    done <<< "$USRS"
+        while IFS= read -r TEST_NAME; do
+            [ -z "$TEST_NAME" ] && continue
+            IMPACTED_TESTS+=("$TEST_NAME")
+            echo "      ✅ Impacted → $TEST_NAME"
+        done <<< "$MATCHING_TESTS"
+
+    done <<< "$SYMBOL_NAMES"
 
 done <<< "$CHANGED_FILES"
 echo ""
@@ -159,7 +159,6 @@ if [ ${#UNIQUE_TESTS[@]} -eq 0 ]; then
     echo "   Consider running the full test suite to be safe."
     echo ""
 else
-    # Robustly pick latest available iPhone simulator
     SIM_NAME=$(xcrun simctl list devices available \
         | grep -E "iPhone [0-9]+" \
         | grep -v "unavailable" \
@@ -193,7 +192,6 @@ fi
 echo "📊 Calculating Delta Coverage for Changed Lines..."
 echo ""
 
-# Locate the most recent .xcresult bundle
 RESULT_BUNDLE=$(ls -dt "$DERIVED_DATA_DIR/$PROJECT_NAME-"*/Logs/Test/*.xcresult 2>/dev/null | head -1)
 
 if [ -z "$RESULT_BUNDLE" ]; then
@@ -212,9 +210,8 @@ else
         [ -z "$FILE" ] && continue
         echo "   📄 Checking coverage: $FILE"
 
-        # Pure awk — avoids macOS BSD sed trap entirely
-        # Parses hunk headers like "+42,8" or "+42" (no comma = 1 line)
-        # and expands into every individual line number
+        # Pure awk — avoids macOS BSD sed trap
+        # Expands hunk headers into every individual changed line number
         CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
             | awk '
                 /^@@/ {
@@ -230,7 +227,6 @@ else
             continue
         fi
 
-        # Extract JSON coverage for this file
         FILE_COVERAGE_JSON=$(xcrun xccov view \
             --file "$FILE" \
             --json "$RESULT_BUNDLE" 2>/dev/null)
@@ -243,7 +239,6 @@ else
         for LINE in $CHANGED_LINE_NUMBERS; do
             ((TOTAL_CHANGED_LINES++))
 
-            # Use Python3 (built-in on macOS) to parse JSON
             EXEC_COUNT=$(echo "$FILE_COVERAGE_JSON" | python3 -c "
 import sys, json
 try:
@@ -262,11 +257,9 @@ except:
 
     done <<< "$CHANGED_FILES"
 
-    # --- Final Coverage Report ---
     if [ "$TOTAL_CHANGED_LINES" -gt 0 ]; then
         PERCENTAGE=$(awk "BEGIN {printf \"%.2f\", ($COVERED_CHANGED_LINES/$TOTAL_CHANGED_LINES)*100}")
         UNCOVERED=$((TOTAL_CHANGED_LINES - COVERED_CHANGED_LINES))
-
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         echo "📈 DELTA COVERAGE REPORT"
