@@ -23,6 +23,14 @@ class ContentViewModel : ObservableObject {
         testString = "Testing the test"
     }
     
+    func updateTestString4(){
+        testString = "Testing the test"
+    }
+    
+    func updateTestString5(){
+        testString = "Testing the test"
+    }
+    
     func printTest(){
         if !testString.isEmpty{
             print("\(testString)")
@@ -36,6 +44,18 @@ class ContentViewModel : ObservableObject {
     }
     
     func printTest3(){
+        if !testString.isEmpty{
+            print("\(testString)")
+        }
+    }
+    
+    func printTest4(){
+        if !testString.isEmpty{
+            print("\(testString)")
+        }
+    }
+    
+    func printTest5(){
         if !testString.isEmpty{
             print("\(testString)")
         }
