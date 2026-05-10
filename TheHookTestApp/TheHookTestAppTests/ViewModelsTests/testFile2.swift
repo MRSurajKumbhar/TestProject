@@ -10,53 +10,25 @@ import XCTest
 
 final class testFile2Tests: XCTestCase {
     
-    var viewModel: ContentViewModel!
+    var viewModel: testFile2!
 
     override func setUp() {
         super.setUp()
         // Initialize the ViewModel before every test
-        viewModel = ContentViewModel()
-    }
-
-    override func tearDown() {
-        // Clean up after every test
-        viewModel = nil
-        super.tearDown()
+        viewModel = testFile2()
     }
 
     // MARK: - Update Tests
     
     func testUpdateTestString() {
         // Given: The initial state
-        XCTAssertEqual(viewModel.testString, "")
+        XCTAssertEqual(viewModel.testFile2String, "")
         
         // When: We call the update function
-        viewModel.updateTestString()
+        viewModel.updateTestStringtestFile2()
         
         // Then: The string should match our expected output
-        XCTAssertEqual(viewModel.testString, "Testing the test")
-    }
-    
-    func testUpdateTestString1() {
-        // Given: The initial state
-        XCTAssertEqual(viewModel.testString, "")
-        
-        // When: We call the update function
-        viewModel.updateTestString2()
-        
-        // Then: The string should match our expected output
-        XCTAssertEqual(viewModel.testString, "Testing the test")
-    }
-    
-    func testUpdateTestString2() {
-        // Given: The initial state
-        XCTAssertEqual(viewModel.testString, "")
-        
-        // When: We call the update function
-        viewModel.updateTestString3()
-        
-        // Then: The string should match our expected output
-        XCTAssertEqual(viewModel.testString, "Testing the test")
+        XCTAssertEqual(viewModel.testFile2String, "Testing the test")
     }
 
 
