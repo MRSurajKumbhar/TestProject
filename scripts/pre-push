@@ -42,8 +42,6 @@ TEST_TARGET="${PROJECT_NAME}Tests"
 DEVELOP_BRANCH="develop"
 DERIVED_DATA_DIR="$HOME/Library/Developer/Xcode/DerivedData"
 DERIVED_DATA_PATH=$(ls -dt "$DERIVED_DATA_DIR/${PROJECT_NAME}-"* 2>/dev/null | head -1)
-
-# Define result bundle path once — used in STEP 6 and STEP 7
 RESULT_BUNDLE="$DERIVED_DATA_PATH/Logs/Test/PrePush.xcresult"
 
 echo "📦 Project  : $PROJECT_NAME"
@@ -109,13 +107,15 @@ while IFS= read -r FILE; do
     [ -z "$FILE" ] && continue
     echo "   📄 $FILE"
 
-    SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$REPO_ROOT/$FILE" 2>/dev/null \
+    # FIX: Accept both uppercase AND lowercase first letter
+    # Swift convention is uppercase but we support lowercase too (e.g. testFile2)
+    SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Za-z]" "$REPO_ROOT/$FILE" 2>/dev/null \
         | awk '{print $2}' \
         | sed 's/[:(<{].*//' \
         | sort -u)
 
     if [ -z "$SYMBOL_NAMES" ]; then
-        SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$FILE" 2>/dev/null \
+        SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Za-z]" "$FILE" 2>/dev/null \
             | awk '{print $2}' \
             | sed 's/[:(<{].*//' \
             | sort -u)
@@ -188,10 +188,7 @@ else
     echo "   Simulator : $SIM_NAME"
     echo ""
 
-    # Remove old result bundle so coverage is always fresh
     rm -rf "$RESULT_BUNDLE"
-
-    # Ensure Logs/Test directory exists
     mkdir -p "$DERIVED_DATA_PATH/Logs/Test"
 
     xcrun xcodebuild test \
@@ -233,13 +230,6 @@ else
     echo "   ✅ Using: $RESULT_BUNDLE"
     echo ""
 
-    # FIX: Use --archive which works on Xcode 26
-    # Output format per line:
-    #   /path/to/File.swift:
-    #    1: *    ← not executable (comment/blank)
-    #    2: 0    ← executable, NOT covered
-    #    3: 1    ← executable, covered
-    # Dump entire archive coverage once — parse per file from it
     echo "   ⏳ Loading coverage archive..."
     COVERAGE_ARCHIVE=$(xcrun xccov view --archive "$RESULT_BUNDLE" 2>/dev/null)
 
@@ -253,12 +243,16 @@ else
         TOTAL_CHANGED_LINES=0
         COVERED_CHANGED_LINES=0
 
+        # Per-file coverage tracking
+        declare -a FILE_NAMES=()
+        declare -a FILE_TOTAL=()
+        declare -a FILE_COVERED=()
+        FILE_INDEX=0
+
         while IFS= read -r FILE; do
             [ -z "$FILE" ] && continue
-            echo "   📄 Checking coverage: $FILE"
+            echo "   📄 $(basename $FILE)"
 
-            # Get changed line numbers using pure POSIX awk
-            # Works on all macOS awk versions
             CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
                 | grep "^@@" \
                 | awk '{
@@ -282,14 +276,11 @@ else
             fi
 
             LINE_COUNT=$(echo "$CHANGED_LINE_NUMBERS" | wc -l | tr -d ' ')
-            echo "      Found $LINE_COUNT changed line(s)"
+            echo "      Changed lines : $LINE_COUNT"
 
-            # Get absolute file path to match against coverage archive
             ABSOLUTE_FILE="$REPO_ROOT/$FILE"
 
-            # Extract coverage for this specific file from the archive dump
-            # Archive format: "/path/File.swift:\n  1: *\n  2: 0\n  3: 1"
-            # python3 parses it into a dict of {line_number: execution_count}
+            # Extract per-line coverage for this file from the archive
             FILE_LINE_COVERAGE=$(echo "$COVERAGE_ARCHIVE" | python3 -c "
 import sys
 
@@ -299,14 +290,10 @@ inside_file = False
 
 for raw_line in sys.stdin:
     line = raw_line.rstrip()
-
-    # Detect file header line e.g. '/path/to/File.swift:'
     if line.endswith(':') and not line.startswith(' ') and '.swift' in line:
         inside_file = (line.rstrip(':') == target_file)
         continue
-
     if inside_file:
-        # Line format: '  18: 1' or '  18: *'
         stripped = line.strip()
         if not stripped:
             continue
@@ -315,7 +302,6 @@ for raw_line in sys.stdin:
             try:
                 lineno = int(parts[0].strip())
                 count_str = parts[1].strip()
-                # * means not executable, skip
                 if count_str == '*':
                     continue
                 count = int(count_str)
@@ -323,7 +309,6 @@ for raw_line in sys.stdin:
             except ValueError:
                 continue
 
-# Print as 'lineno:count' pairs
 for k, v in lines_coverage.items():
     print(f'{k}:{v}')
 " 2>/dev/null)
@@ -333,38 +318,75 @@ for k, v in lines_coverage.items():
                 continue
             fi
 
-            echo "      ✅ Coverage data loaded"
+            # Count covered vs total for this file
+            FILE_COVERED_COUNT=0
+            FILE_TOTAL_COUNT=0
 
-            # Check each changed line against coverage data
             for LINE in $CHANGED_LINE_NUMBERS; do
                 ((TOTAL_CHANGED_LINES++))
+                ((FILE_TOTAL_COUNT++))
 
-                # Look up this line number in coverage output
                 EXEC_COUNT=$(echo "$FILE_LINE_COVERAGE" \
                     | grep -E "^${LINE}:" \
                     | cut -d: -f2)
-
-                # Default to 0 if line not found (not executable)
                 EXEC_COUNT=${EXEC_COUNT:-0}
 
                 if [[ "$EXEC_COUNT" -gt 0 ]]; then
                     ((COVERED_CHANGED_LINES++))
+                    ((FILE_COVERED_COUNT++))
                 fi
             done
 
+            # Store per-file result
+            FILE_NAMES[$FILE_INDEX]="$(basename $FILE)"
+            FILE_TOTAL[$FILE_INDEX]=$FILE_TOTAL_COUNT
+            FILE_COVERED[$FILE_INDEX]=$FILE_COVERED_COUNT
+            ((FILE_INDEX++))
+
+            # Per-file coverage summary
+            FILE_UNCOVERED=$((FILE_TOTAL_COUNT - FILE_COVERED_COUNT))
+            if [ $FILE_TOTAL_COUNT -gt 0 ]; then
+                FILE_PCT=$(awk "BEGIN {printf \"%.2f\", ($FILE_COVERED_COUNT/$FILE_TOTAL_COUNT)*100}")
+                echo "      ✅ Covered    : $FILE_COVERED_COUNT"
+                echo "      ❌ Uncovered  : $FILE_UNCOVERED"
+                echo "      📊 Coverage   : $FILE_PCT%"
+            fi
+
         done <<< "$CHANGED_FILES"
 
+        # --- Per-file summary table ---
+        if [ $FILE_INDEX -gt 0 ]; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📋 PER-FILE COVERAGE BREAKDOWN"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            for ((i=0; i<FILE_INDEX; i++)); do
+                F_NAME="${FILE_NAMES[$i]}"
+                F_TOTAL="${FILE_TOTAL[$i]}"
+                F_COV="${FILE_COVERED[$i]}"
+                F_UNCOV=$((F_TOTAL - F_COV))
+                if [ $F_TOTAL -gt 0 ]; then
+                    F_PCT=$(awk "BEGIN {printf \"%.2f\", ($F_COV/$F_TOTAL)*100}")
+                    echo "   📄 $F_NAME"
+                    echo "      Lines: $F_TOTAL | ✅ $F_COV | ❌ $F_UNCOV | 📊 $F_PCT%"
+                fi
+            done
+        fi
+
+        # --- Overall delta coverage ---
         if [ "$TOTAL_CHANGED_LINES" -gt 0 ]; then
             PERCENTAGE=$(awk "BEGIN {printf \"%.2f\", ($COVERED_CHANGED_LINES/$TOTAL_CHANGED_LINES)*100}")
             UNCOVERED=$((TOTAL_CHANGED_LINES - COVERED_CHANGED_LINES))
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "📈 DELTA COVERAGE REPORT"
+            echo "📈 OVERALL DELTA COVERAGE REPORT"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
             echo "   Total changed lines   : $TOTAL_CHANGED_LINES"
             echo "   ✅ Covered            : $COVERED_CHANGED_LINES"
             echo "   ❌ Uncovered          : $UNCOVERED"
             echo "   📊 Coverage           : $PERCENTAGE%"
+            echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
         else
