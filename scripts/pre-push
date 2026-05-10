@@ -107,8 +107,8 @@ while IFS= read -r FILE; do
     [ -z "$FILE" ] && continue
     echo "   📄 $FILE"
 
-    # FIX: Accept both uppercase AND lowercase first letter
-    # Swift convention is uppercase but we support lowercase too (e.g. testFile2)
+    # Accept both uppercase AND lowercase first letter
+    # Also handles digits in names e.g. testFile2
     SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Za-z]" "$REPO_ROOT/$FILE" 2>/dev/null \
         | awk '{print $2}' \
         | sed 's/[:(<{].*//' \
@@ -134,9 +134,12 @@ while IFS= read -r FILE; do
     while IFS= read -r SYMBOL; do
         [ -z "$SYMBOL" ] && continue
 
+        # FIX: [A-Za-z0-9]+ handles digits in class names like testFile2Tests
+        # FIX: ^${SYMBOL}Tests$ anchors prevent false positives like
+        #      ViewModelsTestsContentViewModelTests or TheHookTestAppTests
         MATCHING_TESTS=$(echo "$INDEX_DUMP" \
             | grep -F "$SYMBOL" \
-            | grep -oE "[A-Za-z]+Tests" \
+            | grep -oE "[A-Za-z0-9]+Tests" \
             | grep -E "^${SYMBOL}Tests$" \
             | sort -u)
 
@@ -188,6 +191,7 @@ else
     echo "   Simulator : $SIM_NAME"
     echo ""
 
+    # Remove old result bundle so coverage is always fresh
     rm -rf "$RESULT_BUNDLE"
     mkdir -p "$DERIVED_DATA_PATH/Logs/Test"
 
@@ -243,7 +247,7 @@ else
         TOTAL_CHANGED_LINES=0
         COVERED_CHANGED_LINES=0
 
-        # Per-file coverage tracking
+        # Per-file tracking arrays
         declare -a FILE_NAMES=()
         declare -a FILE_TOTAL=()
         declare -a FILE_COVERED=()
@@ -253,6 +257,8 @@ else
             [ -z "$FILE" ] && continue
             echo "   📄 $(basename $FILE)"
 
+            # Pure POSIX awk — works on all macOS awk versions
+            # Expands every hunk header into all individual line numbers
             CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
                 | grep "^@@" \
                 | awk '{
@@ -281,6 +287,11 @@ else
             ABSOLUTE_FILE="$REPO_ROOT/$FILE"
 
             # Extract per-line coverage for this file from the archive
+            # Archive format:
+            #   /path/File.swift:
+            #    1: *   ← not executable
+            #    2: 0   ← not covered
+            #    3: 1   ← covered
             FILE_LINE_COVERAGE=$(echo "$COVERAGE_ARCHIVE" | python3 -c "
 import sys
 
@@ -318,7 +329,6 @@ for k, v in lines_coverage.items():
                 continue
             fi
 
-            # Count covered vs total for this file
             FILE_COVERED_COUNT=0
             FILE_TOTAL_COUNT=0
 
@@ -337,13 +347,13 @@ for k, v in lines_coverage.items():
                 fi
             done
 
-            # Store per-file result
+            # Store per-file results
             FILE_NAMES[$FILE_INDEX]="$(basename $FILE)"
             FILE_TOTAL[$FILE_INDEX]=$FILE_TOTAL_COUNT
             FILE_COVERED[$FILE_INDEX]=$FILE_COVERED_COUNT
             ((FILE_INDEX++))
 
-            # Per-file coverage summary
+            # Inline per-file summary
             FILE_UNCOVERED=$((FILE_TOTAL_COUNT - FILE_COVERED_COUNT))
             if [ $FILE_TOTAL_COUNT -gt 0 ]; then
                 FILE_PCT=$(awk "BEGIN {printf \"%.2f\", ($FILE_COVERED_COUNT/$FILE_TOTAL_COUNT)*100}")
