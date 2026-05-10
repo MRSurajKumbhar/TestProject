@@ -134,9 +134,8 @@ while IFS= read -r FILE; do
     while IFS= read -r SYMBOL; do
         [ -z "$SYMBOL" ] && continue
 
-        # FIX: [A-Za-z0-9]+ handles digits in class names like testFile2Tests
-        # FIX: ^${SYMBOL}Tests$ anchors prevent false positives like
-        #      ViewModelsTestsContentViewModelTests or TheHookTestAppTests
+        # [A-Za-z0-9]+ handles digits in names like testFile2Tests
+        # ^${SYMBOL}Tests$ anchors prevent false positives
         MATCHING_TESTS=$(echo "$INDEX_DUMP" \
             | grep -F "$SYMBOL" \
             | grep -oE "[A-Za-z0-9]+Tests" \
@@ -191,7 +190,6 @@ else
     echo "   Simulator : $SIM_NAME"
     echo ""
 
-    # Remove old result bundle so coverage is always fresh
     rm -rf "$RESULT_BUNDLE"
     mkdir -p "$DERIVED_DATA_PATH/Logs/Test"
 
@@ -247,7 +245,6 @@ else
         TOTAL_CHANGED_LINES=0
         COVERED_CHANGED_LINES=0
 
-        # Per-file tracking arrays
         declare -a FILE_NAMES=()
         declare -a FILE_TOTAL=()
         declare -a FILE_COVERED=()
@@ -258,7 +255,7 @@ else
             echo "   📄 $(basename $FILE)"
 
             # Pure POSIX awk — works on all macOS awk versions
-            # Expands every hunk header into all individual line numbers
+            # Expands every hunk into all individual line numbers
             CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
                 | grep "^@@" \
                 | awk '{
@@ -281,17 +278,11 @@ else
                 continue
             fi
 
-            LINE_COUNT=$(echo "$CHANGED_LINE_NUMBERS" | wc -l | tr -d ' ')
-            echo "      Changed lines : $LINE_COUNT"
-
             ABSOLUTE_FILE="$REPO_ROOT/$FILE"
 
-            # Extract per-line coverage for this file from the archive
-            # Archive format:
-            #   /path/File.swift:
-            #    1: *   ← not executable
-            #    2: 0   ← not covered
-            #    3: 1   ← covered
+            # Extract per-line coverage from archive
+            # Lines marked * are not executable and are NOT included in output
+            # Only executable lines (0 or >0) are returned as lineno:count
             FILE_LINE_COVERAGE=$(echo "$COVERAGE_ARCHIVE" | python3 -c "
 import sys
 
@@ -313,6 +304,7 @@ for raw_line in sys.stdin:
             try:
                 lineno = int(parts[0].strip())
                 count_str = parts[1].strip()
+                # Skip non-executable lines (comments, imports, blanks)
                 if count_str == '*':
                     continue
                 count = int(count_str)
@@ -333,13 +325,20 @@ for k, v in lines_coverage.items():
             FILE_TOTAL_COUNT=0
 
             for LINE in $CHANGED_LINE_NUMBERS; do
-                ((TOTAL_CHANGED_LINES++))
-                ((FILE_TOTAL_COUNT++))
-
                 EXEC_COUNT=$(echo "$FILE_LINE_COVERAGE" \
                     | grep -E "^${LINE}:" \
                     | cut -d: -f2)
-                EXEC_COUNT=${EXEC_COUNT:-0}
+
+                # FIX: If line not in coverage data it is non-executable
+                # Skip it entirely — same as SonarQube behaviour
+                # Comments, imports, blank lines, class declarations = not counted
+                if [ -z "$EXEC_COUNT" ]; then
+                    continue
+                fi
+
+                # Only count executable lines
+                ((TOTAL_CHANGED_LINES++))
+                ((FILE_TOTAL_COUNT++))
 
                 if [[ "$EXEC_COUNT" -gt 0 ]]; then
                     ((COVERED_CHANGED_LINES++))
@@ -347,19 +346,20 @@ for k, v in lines_coverage.items():
                 fi
             done
 
-            # Store per-file results
             FILE_NAMES[$FILE_INDEX]="$(basename $FILE)"
             FILE_TOTAL[$FILE_INDEX]=$FILE_TOTAL_COUNT
             FILE_COVERED[$FILE_INDEX]=$FILE_COVERED_COUNT
             ((FILE_INDEX++))
 
-            # Inline per-file summary
             FILE_UNCOVERED=$((FILE_TOTAL_COUNT - FILE_COVERED_COUNT))
             if [ $FILE_TOTAL_COUNT -gt 0 ]; then
                 FILE_PCT=$(awk "BEGIN {printf \"%.2f\", ($FILE_COVERED_COUNT/$FILE_TOTAL_COUNT)*100}")
-                echo "      ✅ Covered    : $FILE_COVERED_COUNT"
-                echo "      ❌ Uncovered  : $FILE_UNCOVERED"
-                echo "      📊 Coverage   : $FILE_PCT%"
+                echo "      Executable lines : $FILE_TOTAL_COUNT"
+                echo "      ✅ Covered       : $FILE_COVERED_COUNT"
+                echo "      ❌ Uncovered     : $FILE_UNCOVERED"
+                echo "      📊 Coverage      : $FILE_PCT%"
+            else
+                echo "      ⚪ No executable changed lines in this file"
             fi
 
         done <<< "$CHANGED_FILES"
@@ -369,6 +369,8 @@ for k, v in lines_coverage.items():
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "📋 PER-FILE COVERAGE BREAKDOWN"
+            echo "   (executable lines only — excludes comments,"
+            echo "    imports, blank lines, declarations)"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             for ((i=0; i<FILE_INDEX; i++)); do
                 F_NAME="${FILE_NAMES[$i]}"
@@ -379,6 +381,9 @@ for k, v in lines_coverage.items():
                     F_PCT=$(awk "BEGIN {printf \"%.2f\", ($F_COV/$F_TOTAL)*100}")
                     echo "   📄 $F_NAME"
                     echo "      Lines: $F_TOTAL | ✅ $F_COV | ❌ $F_UNCOV | 📊 $F_PCT%"
+                else
+                    echo "   📄 $F_NAME"
+                    echo "      ⚪ No executable changed lines"
                 fi
             done
         fi
@@ -390,12 +395,13 @@ for k, v in lines_coverage.items():
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo "📈 OVERALL DELTA COVERAGE REPORT"
+            echo "   (executable lines only)"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
-            echo "   Total changed lines   : $TOTAL_CHANGED_LINES"
-            echo "   ✅ Covered            : $COVERED_CHANGED_LINES"
-            echo "   ❌ Uncovered          : $UNCOVERED"
-            echo "   📊 Coverage           : $PERCENTAGE%"
+            echo "   Total executable lines : $TOTAL_CHANGED_LINES"
+            echo "   ✅ Covered             : $COVERED_CHANGED_LINES"
+            echo "   ❌ Uncovered           : $UNCOVERED"
+            echo "   📊 Coverage            : $PERCENTAGE%"
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             echo ""
