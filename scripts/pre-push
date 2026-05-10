@@ -1,94 +1,179 @@
-
 #!/bin/bash
 
+echo ""
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "        🔍 Pre-Push Impact Analysis"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
 # --- PRE-FLIGHT CHECK ---
-if ! xcrun swift-ide-test -help &>/dev/null; then
-    echo "❌ swift-ide-test not available. Ensure Xcode Command Line Tools are installed."
+if ! xcrun --find xcodebuild &>/dev/null; then
+    echo "❌ Xcode not found."
+    echo "   Please install Xcode from the App Store."
+    echo ""
+    exit 1
+fi
+
+if ! xcrun xcodebuild -version &>/dev/null; then
+    echo "❌ Xcode found but not responding."
+    echo "   Run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer"
+    echo ""
     exit 1
 fi
 
 # --- CONFIGURATION ---
-PROJECT_NAME="YourProjectName"
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+
+# Find the actual .xcodeproj path (handles nested folder structures)
+XCODEPROJ_PATH=$(find "$REPO_ROOT" -maxdepth 3 -name "*.xcodeproj" | head -1)
+
+if [ -z "$XCODEPROJ_PATH" ]; then
+    echo "❌ Could not find .xcodeproj in the repo."
+    echo ""
+    exit 1
+fi
+
+# Derive project name and directory from the found path
+PROJECT_NAME=$(basename "$XCODEPROJ_PATH" | sed 's/\.xcodeproj//')
+PROJECT_DIR=$(dirname "$XCODEPROJ_PATH")
+
+if [ -z "$PROJECT_NAME" ]; then
+    echo "❌ Could not detect project name."
+    echo ""
+    exit 1
+fi
+
 TEST_TARGET="${PROJECT_NAME}Tests"
 DEVELOP_BRANCH="develop"
 DERIVED_DATA_DIR="$HOME/Library/Developer/Xcode/DerivedData"
+DERIVED_DATA_PATH=$(ls -dt "$DERIVED_DATA_DIR/${PROJECT_NAME}-"* 2>/dev/null | head -1)
 
-echo "🔍 Starting Compiler-Layer Impact Analysis..."
+echo "📦 Project  : $PROJECT_NAME"
+echo "📁 Location : $XCODEPROJ_PATH"
+echo "🎯 Target   : $TEST_TARGET"
+echo "🌿 Branch   : $DEVELOP_BRANCH"
+echo ""
 
-# 1. Find Index Store
+# --- STEP 1: Find Index Store ---
+echo "📂 Locating compiler index..."
 DATA_STORE=$(ls -dt "$DERIVED_DATA_DIR/${PROJECT_NAME}-"*/Index.noindex/DataStore 2>/dev/null | head -1)
+
 if [ -z "$DATA_STORE" ]; then
-    echo "❌ Index Store not found. Build the project in Xcode first."
+    echo ""
+    echo "❌ Index Store not found."
+    echo "   Please build the project in Xcode first → Cmd + B"
+    echo ""
     exit 1
 fi
-echo "📂 Using DataStore: $DATA_STORE"
+echo "   ✅ Found: $DATA_STORE"
+echo ""
 
-# 2. Get changed Swift source files (staged + unstaged, no test files)
+# --- STEP 2: Get changed Swift source files ---
+echo "📄 Finding changed Swift files vs $DEVELOP_BRANCH..."
 CHANGED_FILES=$({ git diff "$DEVELOP_BRANCH" --name-only; git diff --cached --name-only; } \
     | grep "\.swift$" \
     | grep -vE "Tests|Spec" \
     | sort -u)
 
 if [ -z "$CHANGED_FILES" ]; then
-    echo "✅ No source files changed. Skipping."
+    echo "   ✅ No source files changed. Nothing to analyse."
+    echo ""
     exit 0
 fi
 
-# 3. Dump index ONCE
-echo "⏳ Loading index..."
-INDEX_DUMP=$(xcrun swift-ide-test \
-    -print-indexed-symbols \
-    -index-store-path "$DATA_STORE" 2>/dev/null)
+echo "   Changed files:"
+while IFS= read -r FILE; do
+    echo "   → $FILE"
+done <<< "$CHANGED_FILES"
+echo ""
+
+# --- STEP 3: Dump raw index ONCE ---
+echo "⏳ Loading compiler index..."
+INDEX_DUMP=$(find "$DATA_STORE" -type f \
+    | xargs strings 2>/dev/null)
 
 if [ -z "$INDEX_DUMP" ]; then
-    echo "❌ Failed to read index. Try rebuilding in Xcode."
+    echo ""
+    echo "❌ Failed to read compiler index."
+    echo "   Try rebuilding in Xcode → Cmd + B"
+    echo ""
     exit 1
 fi
+echo "   ✅ Index loaded"
+echo ""
+
+# --- STEP 4: Analyze each changed file ---
+echo "🔬 Analysing symbol references..."
+echo ""
 
 IMPACTED_TESTS=()
 
-# 4. Analyze each changed file (while+read handles spaces in paths)
 while IFS= read -r FILE; do
     [ -z "$FILE" ] && continue
-    echo "📄 Analyzing: $FILE"
+    echo "   📄 $FILE"
 
-    # Extract USRs for symbols defined in this file
-    # Full Swift USR charset: s: prefix + alphanumeric, $, ., :, @
-    USRS=$(grep -F "$FILE" <<< "$INDEX_DUMP" \
-        | grep "def:" \
-        | grep -oE "s:[a-zA-Z0-9_\$.:@]+" \
+    # Extract class/struct/enum/protocol/actor names from Swift source
+    SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$REPO_ROOT/$FILE" 2>/dev/null \
+        | awk '{print $2}' \
+        | sed 's/[:(<{].*//' \
         | sort -u)
 
-    while IFS= read -r USR; do
-        [ -z "$USR" ] && continue
+    # Fallback without REPO_ROOT prefix
+    if [ -z "$SYMBOL_NAMES" ]; then
+        SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$FILE" 2>/dev/null \
+            | awk '{print $2}' \
+            | sed 's/[:(<{].*//' \
+            | sort -u)
+    fi
 
-        # Find all .swift files referencing this USR
-        REFS=$(grep -F "$USR" <<< "$INDEX_DUMP" \
-            | grep "ref:" \
-            | grep -oE "[^[:space:]]+\.swift")
+    if [ -z "$SYMBOL_NAMES" ]; then
+        echo "      ⚪ No public symbols found in this file"
+        continue
+    fi
 
-        while IFS= read -r REF; do
-            [ -z "$REF" ] && continue
-            if [[ "$REF" == *"Tests.swift" ]] || \
-               [[ "$REF" == *"Spec.swift" ]] || \
-               [[ "$REF" == *"/Tests/"* ]]; then
-                TEST_NAME=$(basename "$REF" .swift)
-                IMPACTED_TESTS+=("$TEST_NAME")
-            fi
-        done <<< "$REFS"
+    echo "      Symbols found:"
+    while IFS= read -r SYMBOL; do
+        echo "      → $SYMBOL"
+    done <<< "$SYMBOL_NAMES"
 
-    done <<< "$USRS"
+    while IFS= read -r SYMBOL; do
+        [ -z "$SYMBOL" ] && continue
+
+        # Exact match only: ^SymbolNameTests$
+        # Rejects: ViewModelsTestsContentViewModelTests, TheHookTestAppTests
+        # Accepts: ContentViewModelTests
+        MATCHING_TESTS=$(echo "$INDEX_DUMP" \
+            | grep -F "$SYMBOL" \
+            | grep -oE "[A-Za-z]+Tests" \
+            | grep -E "^${SYMBOL}Tests$" \
+            | sort -u)
+
+        if [ -z "$MATCHING_TESTS" ]; then
+            echo "      ⚪ No test references found for $SYMBOL"
+            continue
+        fi
+
+        while IFS= read -r TEST_NAME; do
+            [ -z "$TEST_NAME" ] && continue
+            IMPACTED_TESTS+=("$TEST_NAME")
+            echo "      ✅ Impacted → $TEST_NAME"
+        done <<< "$MATCHING_TESTS"
+
+    done <<< "$SYMBOL_NAMES"
 
 done <<< "$CHANGED_FILES"
+echo ""
 
-# 5. Deduplicate
+# --- STEP 5: Deduplicate ---
 UNIQUE_TESTS=($(printf "%s\n" "${IMPACTED_TESTS[@]}" | sort -u))
 
-# 6. Report & Dynamic Simulator Selection
+# --- STEP 6: Auto-Run Impacted Tests ---
 if [ ${#UNIQUE_TESTS[@]} -eq 0 ]; then
-    echo "⚠️  No test references found for changed files."
+    echo "⚠️  No direct test references found for your changes."
+    echo "   Skipping test run."
+    echo ""
 else
-    # Robustly pick latest available iPhone simulator
+    # Pick latest available iPhone simulator
     SIM_NAME=$(xcrun simctl list devices available \
         | grep -E "iPhone [0-9]+" \
         | grep -v "unavailable" \
@@ -97,66 +182,104 @@ else
         | sed 's/ (.*//')
     [ -z "$SIM_NAME" ] && SIM_NAME="iPhone 15"
 
-    echo "------------------------------------------------"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "🚩 IMPACTED TESTS DETECTED:"
+    echo ""
     TEST_FLAGS=""
     for T in "${UNIQUE_TESTS[@]}"; do
-        echo "  - $T"
+        echo "   - $T"
         TEST_FLAGS+="-only-testing:${TEST_TARGET}/${T} "
     done
-    echo "------------------------------------------------"
-    echo "🚀 Run this before pushing (Coverage Enabled):"
     echo ""
-    echo "xcodebuild test \\"
-    echo "  -scheme $PROJECT_NAME \\"
-    echo "  -destination 'platform=iOS Simulator,name=$SIM_NAME' \\"
-    echo "  -enableCodeCoverage YES \\"
-    echo "  $TEST_FLAGS"
-    echo "------------------------------------------------"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🚀 Auto-running impacted tests..."
+    echo "   Project   : $XCODEPROJ_PATH"
+    echo "   Simulator : $SIM_NAME"
+    echo ""
+
+    # Define fresh result bundle path
+    RESULT_BUNDLE="$DERIVED_DATA_PATH/Logs/Test/PrePush.xcresult"
+
+    # Remove old result bundle so coverage is always fresh
+    rm -rf "$RESULT_BUNDLE"
+
+    # Run tests using explicit -project path to handle nested folder structures
+    xcrun xcodebuild test \
+        -project "$XCODEPROJ_PATH" \
+        -scheme "$PROJECT_NAME" \
+        -destination "platform=iOS Simulator,name=$SIM_NAME" \
+        -enableCodeCoverage YES \
+        -resultBundlePath "$RESULT_BUNDLE" \
+        $TEST_FLAGS \
+        2>&1 | grep -E "Test (passed|failed|started)|error:|FAILED|PASSED|Build succeeded|Build FAILED"
+
+    TEST_EXIT_CODE=${PIPESTATUS[0]}
+
+    echo ""
+    if [ $TEST_EXIT_CODE -ne 0 ]; then
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "❌ TESTS FAILED — Push blocked."
+        echo "   Fix the failing tests before pushing."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        exit 1
+    else
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "✅ ALL TESTS PASSED — Proceeding with push."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+    fi
 fi
 
-# --- 7. DELTA COVERAGE PHASE (Office Friendly / No JQ) ---
-echo "📊 Calculating Coverage for Changed Lines..."
+# --- STEP 7: DELTA COVERAGE PHASE ---
+echo "📊 Calculating Delta Coverage for Changed Lines..."
+echo ""
 
-# Locate the .xcresult bundle
-RESULT_BUNDLE=$(ls -dt "$DERIVED_DATA_DIR/$PROJECT_NAME-"*/Logs/Test/*.xcresult 2>/dev/null | head -1)
+RESULT_BUNDLE=$(ls -dt "$DERIVED_DATA_PATH/Logs/Test/"*.xcresult 2>/dev/null | head -1)
 
 if [ -z "$RESULT_BUNDLE" ]; then
-    echo "⚠️  No .xcresult found. Run tests with -enableCodeCoverage YES first."
+    echo "⚠️  No .xcresult bundle found."
+    echo "   Coverage will appear on your next push after tests run."
+    echo ""
 else
+    echo "   ✅ Using: $RESULT_BUNDLE"
+    echo ""
+
     TOTAL_CHANGED_LINES=0
     COVERED_CHANGED_LINES=0
 
     while IFS= read -r FILE; do
         [ -z "$FILE" ] && continue
+        echo "   📄 Checking coverage: $FILE"
 
-        # FIX: Pure awk solution — avoids macOS BSD sed \? trap entirely
-        # Parses hunk headers like "+42,8" or "+42" (no comma = 1 line)
-        # and expands them into every individual line number
+        # Pure awk — expands every hunk into all individual line numbers
         CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
             | awk '
                 /^@@/ {
-                    # Extract the "+start,count" part from the hunk header
                     match($0, /\+([0-9]+)(,([0-9]+))?/, arr)
                     start = arr[1]
-                    # If no comma+count, it is a single line change
                     count = (arr[3] != "") ? arr[3] : 1
-                    # Expand: print each line number in the hunk
                     for (i = 0; i < count; i++) print start + i
                 }
             ')
 
-        if [ -z "$CHANGED_LINE_NUMBERS" ]; then continue; fi
+        if [ -z "$CHANGED_LINE_NUMBERS" ]; then
+            echo "      ⚪ No changed lines found"
+            continue
+        fi
 
-        # Extract JSON coverage for the file
-        FILE_COVERAGE_JSON=$(xcrun xccov view --file "$FILE" --json "$RESULT_BUNDLE" 2>/dev/null)
+        FILE_COVERAGE_JSON=$(xcrun xccov view \
+            --file "$FILE" \
+            --json "$RESULT_BUNDLE" 2>/dev/null)
 
-        if [ -z "$FILE_COVERAGE_JSON" ]; then continue; fi
+        if [ -z "$FILE_COVERAGE_JSON" ]; then
+            echo "      ⚪ No coverage data found for this file"
+            continue
+        fi
 
         for LINE in $CHANGED_LINE_NUMBERS; do
             ((TOTAL_CHANGED_LINES++))
 
-            # Use Python (Built-in) to parse the JSON
             EXEC_COUNT=$(echo "$FILE_COVERAGE_JSON" | python3 -c "
 import sys, json
 try:
@@ -172,17 +295,26 @@ except:
                 ((COVERED_CHANGED_LINES++))
             fi
         done
+
     done <<< "$CHANGED_FILES"
 
-    # Percentage calculation
     if [ "$TOTAL_CHANGED_LINES" -gt 0 ]; then
         PERCENTAGE=$(awk "BEGIN {printf \"%.2f\", ($COVERED_CHANGED_LINES/$TOTAL_CHANGED_LINES)*100}")
-        echo "------------------------------------------------"
-        echo "📈 DELTA COVERAGE: $PERCENTAGE%"
-        echo "✅ Covered: $COVERED_CHANGED_LINES | ❌ Uncovered: $((TOTAL_CHANGED_LINES - COVERED_CHANGED_LINES))"
-        echo "------------------------------------------------"
+        UNCOVERED=$((TOTAL_CHANGED_LINES - COVERED_CHANGED_LINES))
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📈 DELTA COVERAGE REPORT"
+        echo ""
+        echo "   Total changed lines   : $TOTAL_CHANGED_LINES"
+        echo "   ✅ Covered            : $COVERED_CHANGED_LINES"
+        echo "   ❌ Uncovered          : $UNCOVERED"
+        echo "   📊 Coverage           : $PERCENTAGE%"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
     else
+        echo ""
         echo "ℹ️  No executable changed lines found to calculate coverage."
+        echo ""
     fi
 fi
 
