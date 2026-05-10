@@ -22,27 +22,4 @@ class ContentViewModel : ObservableObject {
     func updateTestString3(){
         testString = "Testing the test"
     }
-    
-    func updateTestString4(){
-        testString = "Testing the test"
-    }
-    
-    
-    func printTest(){
-        if !testString.isEmpty{
-            print("\(testString)")
-        }
-    }
-    
-    func printTest2(){
-        if !testString.isEmpty{
-            print("\(testString)")
-        }
-    }
-    
-    func printTest3(){
-        if !testString.isEmpty{
-            print("\(testString)")
-        }
-    }
 }
