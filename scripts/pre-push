@@ -24,19 +24,14 @@ fi
 # --- CONFIGURATION ---
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 
-# Find the actual .xcodeproj path (handles nested folder structures)
 XCODEPROJ_PATH=$(find "$REPO_ROOT" -maxdepth 3 -name "*.xcodeproj" | head -1)
-
 if [ -z "$XCODEPROJ_PATH" ]; then
     echo "❌ Could not find .xcodeproj in the repo."
     echo ""
     exit 1
 fi
 
-# Derive project name and directory from the found path
 PROJECT_NAME=$(basename "$XCODEPROJ_PATH" | sed 's/\.xcodeproj//')
-PROJECT_DIR=$(dirname "$XCODEPROJ_PATH")
-
 if [ -z "$PROJECT_NAME" ]; then
     echo "❌ Could not detect project name."
     echo ""
@@ -47,6 +42,9 @@ TEST_TARGET="${PROJECT_NAME}Tests"
 DEVELOP_BRANCH="develop"
 DERIVED_DATA_DIR="$HOME/Library/Developer/Xcode/DerivedData"
 DERIVED_DATA_PATH=$(ls -dt "$DERIVED_DATA_DIR/${PROJECT_NAME}-"* 2>/dev/null | head -1)
+
+# Define result bundle path once — used in STEP 6 and STEP 7
+RESULT_BUNDLE="$DERIVED_DATA_PATH/Logs/Test/PrePush.xcresult"
 
 echo "📦 Project  : $PROJECT_NAME"
 echo "📁 Location : $XCODEPROJ_PATH"
@@ -89,8 +87,7 @@ echo ""
 
 # --- STEP 3: Dump raw index ONCE ---
 echo "⏳ Loading compiler index..."
-INDEX_DUMP=$(find "$DATA_STORE" -type f \
-    | xargs strings 2>/dev/null)
+INDEX_DUMP=$(find "$DATA_STORE" -type f | xargs strings 2>/dev/null)
 
 if [ -z "$INDEX_DUMP" ]; then
     echo ""
@@ -112,13 +109,11 @@ while IFS= read -r FILE; do
     [ -z "$FILE" ] && continue
     echo "   📄 $FILE"
 
-    # Extract class/struct/enum/protocol/actor names from Swift source
     SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$REPO_ROOT/$FILE" 2>/dev/null \
         | awk '{print $2}' \
         | sed 's/[:(<{].*//' \
         | sort -u)
 
-    # Fallback without REPO_ROOT prefix
     if [ -z "$SYMBOL_NAMES" ]; then
         SYMBOL_NAMES=$(grep -E "^(class|struct|enum|protocol|actor) [A-Z]" "$FILE" 2>/dev/null \
             | awk '{print $2}' \
@@ -139,9 +134,6 @@ while IFS= read -r FILE; do
     while IFS= read -r SYMBOL; do
         [ -z "$SYMBOL" ] && continue
 
-        # Exact match only: ^SymbolNameTests$
-        # Rejects: ViewModelsTestsContentViewModelTests, TheHookTestAppTests
-        # Accepts: ContentViewModelTests
         MATCHING_TESTS=$(echo "$INDEX_DUMP" \
             | grep -F "$SYMBOL" \
             | grep -oE "[A-Za-z]+Tests" \
@@ -173,7 +165,6 @@ if [ ${#UNIQUE_TESTS[@]} -eq 0 ]; then
     echo "   Skipping test run."
     echo ""
 else
-    # Pick latest available iPhone simulator
     SIM_NAME=$(xcrun simctl list devices available \
         | grep -E "iPhone [0-9]+" \
         | grep -v "unavailable" \
@@ -197,13 +188,12 @@ else
     echo "   Simulator : $SIM_NAME"
     echo ""
 
-    # Define fresh result bundle path
-    RESULT_BUNDLE="$DERIVED_DATA_PATH/Logs/Test/PrePush.xcresult"
-
     # Remove old result bundle so coverage is always fresh
     rm -rf "$RESULT_BUNDLE"
 
-    # Run tests using explicit -project path to handle nested folder structures
+    # Ensure Logs/Test directory exists
+    mkdir -p "$DERIVED_DATA_PATH/Logs/Test"
+
     xcrun xcodebuild test \
         -project "$XCODEPROJ_PATH" \
         -scheme "$PROJECT_NAME" \
@@ -235,9 +225,7 @@ fi
 echo "📊 Calculating Delta Coverage for Changed Lines..."
 echo ""
 
-RESULT_BUNDLE=$(ls -dt "$DERIVED_DATA_PATH/Logs/Test/"*.xcresult 2>/dev/null | head -1)
-
-if [ -z "$RESULT_BUNDLE" ]; then
+if [ ! -d "$RESULT_BUNDLE" ]; then
     echo "⚠️  No .xcresult bundle found."
     echo "   Coverage will appear on your next push after tests run."
     echo ""
@@ -245,76 +233,145 @@ else
     echo "   ✅ Using: $RESULT_BUNDLE"
     echo ""
 
-    TOTAL_CHANGED_LINES=0
-    COVERED_CHANGED_LINES=0
+    # FIX: Use --archive which works on Xcode 26
+    # Output format per line:
+    #   /path/to/File.swift:
+    #    1: *    ← not executable (comment/blank)
+    #    2: 0    ← executable, NOT covered
+    #    3: 1    ← executable, covered
+    # Dump entire archive coverage once — parse per file from it
+    echo "   ⏳ Loading coverage archive..."
+    COVERAGE_ARCHIVE=$(xcrun xccov view --archive "$RESULT_BUNDLE" 2>/dev/null)
 
-    while IFS= read -r FILE; do
-        [ -z "$FILE" ] && continue
-        echo "   📄 Checking coverage: $FILE"
-
-        # Pure awk — expands every hunk into all individual line numbers
-        CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
-            | awk '
-                /^@@/ {
-                    match($0, /\+([0-9]+)(,([0-9]+))?/, arr)
-                    start = arr[1]
-                    count = (arr[3] != "") ? arr[3] : 1
-                    for (i = 0; i < count; i++) print start + i
-                }
-            ')
-
-        if [ -z "$CHANGED_LINE_NUMBERS" ]; then
-            echo "      ⚪ No changed lines found"
-            continue
-        fi
-
-        FILE_COVERAGE_JSON=$(xcrun xccov view \
-            --file "$FILE" \
-            --json "$RESULT_BUNDLE" 2>/dev/null)
-
-        if [ -z "$FILE_COVERAGE_JSON" ]; then
-            echo "      ⚪ No coverage data found for this file"
-            continue
-        fi
-
-        for LINE in $CHANGED_LINE_NUMBERS; do
-            ((TOTAL_CHANGED_LINES++))
-
-            EXEC_COUNT=$(echo "$FILE_COVERAGE_JSON" | python3 -c "
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    lines = data.get('lines', [])
-    count = next((l.get('executionCount', 0) for l in lines if l.get('line') == $LINE), 0)
-    print(count)
-except:
-    print(0)
-" 2>/dev/null)
-
-            if [[ "$EXEC_COUNT" -gt 0 ]]; then
-                ((COVERED_CHANGED_LINES++))
-            fi
-        done
-
-    done <<< "$CHANGED_FILES"
-
-    if [ "$TOTAL_CHANGED_LINES" -gt 0 ]; then
-        PERCENTAGE=$(awk "BEGIN {printf \"%.2f\", ($COVERED_CHANGED_LINES/$TOTAL_CHANGED_LINES)*100}")
-        UNCOVERED=$((TOTAL_CHANGED_LINES - COVERED_CHANGED_LINES))
-        echo ""
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo "📈 DELTA COVERAGE REPORT"
-        echo ""
-        echo "   Total changed lines   : $TOTAL_CHANGED_LINES"
-        echo "   ✅ Covered            : $COVERED_CHANGED_LINES"
-        echo "   ❌ Uncovered          : $UNCOVERED"
-        echo "   📊 Coverage           : $PERCENTAGE%"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ -z "$COVERAGE_ARCHIVE" ]; then
+        echo "   ❌ Failed to load coverage archive."
         echo ""
     else
+        echo "   ✅ Coverage archive loaded"
         echo ""
-        echo "ℹ️  No executable changed lines found to calculate coverage."
-        echo ""
+
+        TOTAL_CHANGED_LINES=0
+        COVERED_CHANGED_LINES=0
+
+        while IFS= read -r FILE; do
+            [ -z "$FILE" ] && continue
+            echo "   📄 Checking coverage: $FILE"
+
+            # Get changed line numbers using pure POSIX awk
+            # Works on all macOS awk versions
+            CHANGED_LINE_NUMBERS=$(git diff "$DEVELOP_BRANCH" -U0 "$FILE" \
+                | grep "^@@" \
+                | awk '{
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^\+[0-9]/) {
+                            val = substr($i, 2)
+                            n = split(val, parts, ",")
+                            start = int(parts[1])
+                            count = (n > 1) ? int(parts[2]) : 1
+                            if (count == 0) next
+                            for (j = 0; j < count; j++) {
+                                print start + j
+                            }
+                        }
+                    }
+                }')
+
+            if [ -z "$CHANGED_LINE_NUMBERS" ]; then
+                echo "      ⚪ No changed lines found"
+                continue
+            fi
+
+            LINE_COUNT=$(echo "$CHANGED_LINE_NUMBERS" | wc -l | tr -d ' ')
+            echo "      Found $LINE_COUNT changed line(s)"
+
+            # Get absolute file path to match against coverage archive
+            ABSOLUTE_FILE="$REPO_ROOT/$FILE"
+
+            # Extract coverage for this specific file from the archive dump
+            # Archive format: "/path/File.swift:\n  1: *\n  2: 0\n  3: 1"
+            # python3 parses it into a dict of {line_number: execution_count}
+            FILE_LINE_COVERAGE=$(echo "$COVERAGE_ARCHIVE" | python3 -c "
+import sys
+
+target_file = '$ABSOLUTE_FILE'
+lines_coverage = {}
+inside_file = False
+
+for raw_line in sys.stdin:
+    line = raw_line.rstrip()
+
+    # Detect file header line e.g. '/path/to/File.swift:'
+    if line.endswith(':') and not line.startswith(' ') and '.swift' in line:
+        inside_file = (line.rstrip(':') == target_file)
+        continue
+
+    if inside_file:
+        # Line format: '  18: 1' or '  18: *'
+        stripped = line.strip()
+        if not stripped:
+            continue
+        parts = stripped.split(':', 1)
+        if len(parts) == 2:
+            try:
+                lineno = int(parts[0].strip())
+                count_str = parts[1].strip()
+                # * means not executable, skip
+                if count_str == '*':
+                    continue
+                count = int(count_str)
+                lines_coverage[lineno] = count
+            except ValueError:
+                continue
+
+# Print as 'lineno:count' pairs
+for k, v in lines_coverage.items():
+    print(f'{k}:{v}')
+" 2>/dev/null)
+
+            if [ -z "$FILE_LINE_COVERAGE" ]; then
+                echo "      ⚪ No coverage data found for this file"
+                continue
+            fi
+
+            echo "      ✅ Coverage data loaded"
+
+            # Check each changed line against coverage data
+            for LINE in $CHANGED_LINE_NUMBERS; do
+                ((TOTAL_CHANGED_LINES++))
+
+                # Look up this line number in coverage output
+                EXEC_COUNT=$(echo "$FILE_LINE_COVERAGE" \
+                    | grep -E "^${LINE}:" \
+                    | cut -d: -f2)
+
+                # Default to 0 if line not found (not executable)
+                EXEC_COUNT=${EXEC_COUNT:-0}
+
+                if [[ "$EXEC_COUNT" -gt 0 ]]; then
+                    ((COVERED_CHANGED_LINES++))
+                fi
+            done
+
+        done <<< "$CHANGED_FILES"
+
+        if [ "$TOTAL_CHANGED_LINES" -gt 0 ]; then
+            PERCENTAGE=$(awk "BEGIN {printf \"%.2f\", ($COVERED_CHANGED_LINES/$TOTAL_CHANGED_LINES)*100}")
+            UNCOVERED=$((TOTAL_CHANGED_LINES - COVERED_CHANGED_LINES))
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "📈 DELTA COVERAGE REPORT"
+            echo ""
+            echo "   Total changed lines   : $TOTAL_CHANGED_LINES"
+            echo "   ✅ Covered            : $COVERED_CHANGED_LINES"
+            echo "   ❌ Uncovered          : $UNCOVERED"
+            echo "   📊 Coverage           : $PERCENTAGE%"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+        else
+            echo ""
+            echo "ℹ️  No executable changed lines found to calculate coverage."
+            echo ""
+        fi
     fi
 fi
 

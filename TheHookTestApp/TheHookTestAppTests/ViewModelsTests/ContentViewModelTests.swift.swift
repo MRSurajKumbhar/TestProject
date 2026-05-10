@@ -36,6 +36,28 @@ final class ContentViewModelTests: XCTestCase {
         // Then: The string should match our expected output
         XCTAssertEqual(viewModel.testString, "Testing the test")
     }
+    
+    func testUpdateTestString1() {
+        // Given: The initial state
+        XCTAssertEqual(viewModel.testString, "")
+        
+        // When: We call the update function
+        viewModel.updateTestString2()
+        
+        // Then: The string should match our expected output
+        XCTAssertEqual(viewModel.testString, "Testing the test")
+    }
+    
+    func testUpdateTestString2() {
+        // Given: The initial state
+        XCTAssertEqual(viewModel.testString, "")
+        
+        // When: We call the update function
+        viewModel.updateTestString3()
+        
+        // Then: The string should match our expected output
+        XCTAssertEqual(viewModel.testString, "Testing the test")
+    }
 
 
 }
